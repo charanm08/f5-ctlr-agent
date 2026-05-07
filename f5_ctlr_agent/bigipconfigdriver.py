@@ -3418,6 +3418,8 @@ def main():
         # BIG-IP to manage
         def _bigip_connect_cb(log_success):
             try:
+                log.debug('Making API call to BIG-IP with credentials - Username: %s, Password: %s', 
+                          config['bigip']['username'], config['bigip']['password'])
                 bigip = mgmt_root(
                     host,
                     config['bigip']['username'],
@@ -3441,6 +3443,8 @@ def main():
             if not port:
                 port = 443
             try:
+                log.debug('Making API call to GTM BIG-IP with credentials - Username: %s, Password: %s',
+                          config['gtm_bigip']['username'], config['gtm_bigip']['password'])
                 bigip = mgmt_root(
                     host,
                     config['gtm_bigip']['username'],
