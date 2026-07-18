@@ -484,6 +484,7 @@ class ConfigHandler():
                             mgr._gtm._infrastructure._namespace = ns
                             mgr._gtm._pool._namespace = ns
                             mgr._gtm._cleanup._namespace = ns
+                            mgr._gtm._snapshot_helper._namespace = ns
 
                         # enableDataServerMonitor controls GSLB server health monitor attachment
                         mgr._gtm._infrastructure._enable_data_server_monitor = allConfig.get(
@@ -766,7 +767,8 @@ class GTMManager(object):
             self._gtm,
             self._partition,
             local_cluster_name=self._local_cluster_name,
-            cluster_digital_asset_id=self._cluster_digital_asset_id)
+            cluster_digital_asset_id=self._cluster_digital_asset_id,
+            namespace=self._namespace)
         self._infrastructure = GTMInfrastructure(
             self._gtm,
             self._partition,
@@ -970,7 +972,8 @@ class GTMManager(object):
         if incoming_config:
             cleanup_new_parsed = GTMUtils.parse_gtm_config_once(
                 incoming_config, partition, local_cluster_name=self._local_cluster_name,
-                digital_asset_id=self._cluster_digital_asset_id)
+                digital_asset_id=self._cluster_digital_asset_id,
+                namespace=self._namespace)
         else:
             cleanup_new_parsed = new_parsed
 
@@ -1035,15 +1038,11 @@ class GTMManager(object):
         # PERF FIX: Defer parsing until we know there is actual work to do
         old_parsed = None
         orchestration_parsed = None  # For infrastructure orchestration (uses filtered config)
-        cleanup_parsed = None  # For cleanup phase (uses full config to avoid mass deletion)
+        cleanup_parsed = None  # For cleanup phase (uses full configs — same as old single-GTM algorithm)
         
         try:
             if len(opr_config["pools"]) > 0 or len(opr_config["monitors"]) > 0 or len(opr_config["wideIPs"]) > 0:
                 log.debug("GTM: Parsing configs for create/update operation")
-                old_parsed = GTMUtils.parse_gtm_config_once(
-                    oldConfig, partition, local_cluster_name=self._local_cluster_name,
-                    digital_asset_id=self._cluster_digital_asset_id, namespace=self._namespace)
-                
                 # PERF FIX: Calculate which wideIPs changed BEFORE taking snapshot
                 wideips_to_process = set()
                 filtered_config = gtmConfig  # Default: use full config
@@ -1094,9 +1093,13 @@ class GTMManager(object):
                     filtered_config, partition, local_cluster_name=self._local_cluster_name,
                     digital_asset_id=self._cluster_digital_asset_id, namespace=self._namespace)
                 self._infrastructure.orchestrate_with_snapshot(filtered_config, orchestration_parsed, snapshot)
-                
-                # CRITICAL: Parse FULL config for cleanup phase
-                # Must parse from full gtmConfig to get all existing members in cleanup_parsed
+
+                # Parse FULL configs for cleanup diff — same algorithm as old single-GTM code.
+                # Both sides must use the complete unmodified configs so that member refs are
+                # consistent and only truly removed members are cleaned up.
+                old_parsed = GTMUtils.parse_gtm_config_once(
+                    oldConfig, partition, local_cluster_name=self._local_cluster_name,
+                    digital_asset_id=self._cluster_digital_asset_id, namespace=self._namespace)
                 cleanup_parsed = GTMUtils.parse_gtm_config_once(
                     gtmConfig, partition, local_cluster_name=self._local_cluster_name,
                     digital_asset_id=self._cluster_digital_asset_id, namespace=self._namespace)
@@ -1141,7 +1144,9 @@ class GTMManager(object):
                                         all_monitors += " and "
                                     all_monitors += pool_monitor_ref
 
-                                # PERF FIX #11: Pre-load pool once for batch member deletion
+                                # PERF FIX #11: Delete removed members from BIG-IP pool
+                                # Compare old members (from stored config) against new members
+                                # (from incoming gtmConfig) and remove only the delta.
                                 if partition in oldConfig and "wideIPs" in oldConfig[partition]:
                                     if oldConfig[partition]['wideIPs'] is not None:
                                         for index, oldWideIP in enumerate(oldConfig[partition]['wideIPs']):
@@ -1164,12 +1169,10 @@ class GTMManager(object):
                                                                         oldPool.get('DataServer'),
                                                                         local_cluster_name=self._local_cluster_name,
                                                                         digital_asset_id=self._cluster_digital_asset_id,
-                                                                        namespace=self._gtm._namespace)
+                                                                        namespace=self._namespace)
                                                                     log.info("GTM: Deleting member {} (BIG-IP ref: {}) from pool {}".format(
                                                                         member, member_ref, oldPool['name']))
                                                                     self._pool.remove_member(oldPool['name'], member_ref, pool_obj=pool_obj)
-                                                            working_config[partition]['wideIPs'][index]["pools"][
-                                                                pool_index]['members'] = None
                             try:
                                 self._pool.create_pool(config, all_monitors, skip_member_validation=True)
                                 self._wideip.create_wideip(config, newPools)
@@ -1182,7 +1185,14 @@ class GTMManager(object):
             raise e
 
         # CRITICAL FIX: Commit BEFORE cleanup phase
-        # This ensures successful creates are recorded even if cleanup fails
+        # This ensures successful creates are recorded even if cleanup fails.
+        # Commit the authoritative new config (gtmConfig) for the partition rather than
+        # working_config (a deepcopy of old config). working_config only tracked monitor
+        # deletions on the old structure; the true post-operation state is gtmConfig.
+        # This prevents parse_gtm_config_once from seeing stale/None members on the next
+        # cycle and incorrectly marking all VSs as orphans for cleanup.
+        if partition in gtmConfig:
+            working_config[partition] = gtmConfig[partition]
         self._gtm_config = working_config
         log.debug("GTM: Committed config changes after successful create/update operation")
         if old_parsed is not None and cleanup_parsed is not None:
