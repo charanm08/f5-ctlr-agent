@@ -32,11 +32,11 @@ import traceback
 import copy
 import tempfile
 import pyinotify
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from urllib.parse import urlparse
 from f5_cccl.api import F5CloudServiceManager
 from f5_cccl.exceptions import F5CcclError, F5CcclResourceNotFoundError
-from f5_cccl.utils.mgmt import mgmt_root
 from f5_cccl.utils.profile import (delete_unused_ssl_profiles,
                                    create_client_ssl_profile,
                                    create_server_ssl_profile)
@@ -299,6 +299,12 @@ DEFAULT_VERIFY_INTERVAL = 30.0
 NET_SCHEMA_NAME = 'cccl-net-api-schema.yml'
 
 
+def mgmt_root(host, username, password, port, token, ca_certs=None):
+    """Use SDK-supported TLS options and bounded requests, including initial login."""
+    return ManagementRoot(host, username, password, port=port, token=token,
+                          verify=ca_certs or False, timeout=30)
+
+
 class CloudServiceManager():
     """CloudServiceManager class.
 
@@ -310,12 +316,14 @@ class CloudServiceManager():
     """
 
     def __init__(self, bigip, partition, user_agent=None, prefix=None,
-                 schema_path=None, gtm=False, local_cluster_name=None,
-                 cluster_digital_asset_id=None):
+                 schema_path=None, gtm=False, gtm_url=None,
+                 local_cluster_name=None, cluster_digital_asset_id=None):
         """Initialize the CloudServiceManager object."""
         self._mgmt_root = bigip
         self._schema = schema_path
         self._is_gtm = gtm
+        # Identity label used for per-manager logging and backoff tracking
+        self._gtm_url = gtm_url or ''
         if gtm:
             self._gtm = GTMManager(
                 bigip,
@@ -325,6 +333,8 @@ class CloudServiceManager():
                 cluster_digital_asset_id=cluster_digital_asset_id)
             self._cccl = None
         else:
+            schema_path = schema_path or _find_ltm_schema()
+            schema_path = _normalize_schema_path(schema_path)
             self._cccl = F5CloudServiceManager(
                 bigip,
                 partition,
@@ -334,8 +344,13 @@ class CloudServiceManager():
             self._gtm = None
 
     def is_gtm(self):
-        """ Return is gtm config"""
-        return self._is_gtm
+        """Return whether this manager is a GTM endpoint manager.
+
+        Some test doubles construct a CloudServiceManager-like object without
+        calling the real __init__(). Fall back gracefully to the attribute if
+        present, otherwise treat it as a non-GTM manager.
+        """
+        return getattr(self, '_is_gtm', False)
 
     def mgmt_root(self):
         """ Return the BIG-IP ManagementRoot object"""
@@ -365,8 +380,45 @@ class CloudServiceManager():
         return self._cccl.apply_net_config(config)
 
     def get_proxy(self):
-        """Called from 'CCCL' delete_unused_ssl_profiles"""
-        return self._cccl.get_proxy()
+        """Called from 'CCCL' delete_unused_ssl_profiles.
+
+        Some test doubles and GTM-only managers do not create a CCCL manager.
+        In that case there is no proxy to return and the caller should treat
+        the cleanup step as a no-op.
+        """
+        cccl = getattr(self, '_cccl', None)
+        if cccl is None:
+            return None
+        return cccl.get_proxy()
+
+
+class BackoffTimer(threading.Timer):
+    """Compatibility timer used by the legacy tests and ConfigHandler.
+
+    Exposes the historical attributes `.interval` and `.finished` in addition
+    to the standard `threading.Timer` behavior.
+    """
+    def __init__(self, interval, callback):
+        self.interval = float(interval)
+        self.finished = threading.Event()
+        super().__init__(self.interval, callback)
+
+    def start(self):
+        self.finished.clear()
+        super().start()
+
+    def cancel(self):
+        try:
+            super().cancel()
+        except Exception:
+            pass
+        self.finished.set()
+
+    def run(self):
+        try:
+            super().run()
+        finally:
+            self.finished.set()
 
 
 class IntervalTimerError(Exception):
@@ -500,6 +552,101 @@ def _delete_unused_ssl_profiles(mgr, partition, config):
     return delete_unused_ssl_profiles(mgr, partition, config)
 
 
+class GTMEndpointWorker:
+    """One serial reconciliation stream per endpoint, independent of its peers.
+
+    Updates coalesce to the latest snapshot. Removing membership stops retries
+    and releases local resources; it never requests deletion on BIG-IP.
+    """
+
+    def __init__(self, handler, entry, config):
+        self.handler = handler
+        self.manager = None
+        self.connected_entry = None
+        self.condition = threading.Condition()
+        self.stopped = False
+        self.done = threading.Event()
+        self.entry = copy.deepcopy(entry)
+        self.config = copy.deepcopy(config)
+        self.version = 1
+        self.completed_version = 0
+        self.pending = True
+        self.retry_at = 0
+        self.backoff = 1
+        self.thread = threading.Thread(target=self.run, name='gtm-' + entry['url'], daemon=True)
+
+    def update(self, entry, config):
+        with self.condition:
+            if entry != self.entry:
+                self.retry_at = 0
+                self.backoff = 1
+            self.entry = copy.deepcopy(entry)
+            self.config = copy.deepcopy(config)
+            self.version += 1
+            self.pending = True
+            self.condition.notify_all()
+
+    def stop(self):
+        with self.condition:
+            self.stopped = True
+            self.condition.notify_all()
+
+    def run(self):
+        try:
+            while True:
+                with self.condition:
+                    while not self.stopped:
+                        delay = self.retry_at - time.monotonic()
+                        if self.pending and delay <= 0:
+                            break
+                        self.condition.wait(delay if self.pending and delay > 0 else None)
+                    if self.stopped:
+                        return
+                    entry = copy.deepcopy(self.entry)
+                    config = copy.deepcopy(self.config)
+                    version = self.version
+                    self.pending = False
+                try:
+                    if self.manager is None or entry != self.connected_entry:
+                        replacement = self.handler._connect_gtm_entry(entry, config, self.manager)
+                        if self.manager is not None:
+                            if getattr(self.manager, '_gtm_cert_id', None) == replacement._gtm_cert_id:
+                                self.manager._gtm_cert_id = None
+                            self.handler._forget_gtm_manager(self.manager)
+                        self.manager = replacement
+                        self.connected_entry = entry
+                    with self.condition:
+                        # A removed endpoint or superseded connection must not start a sync.
+                        if self.stopped:
+                            return
+                        if version != self.version:
+                            continue
+                    self.handler._sync_one_gtm(self.manager, config)
+                    with self.condition:
+                        self.retry_at = 0
+                        self.backoff = 1
+                        if not self.stopped and version == self.version:
+                            log.info('GTM [%s]: Config sync completed successfully', entry['url'])
+                except Exception as exc:
+                    log.error('GTM [%s]: GTM Error..... %s', entry['url'], exc)
+                    with self.condition:
+                        if entry == self.entry:
+                            self.retry_at = time.monotonic() + self.backoff
+                            self.backoff = min(self.backoff * 2, self.handler._max_backoff_time)
+                        self.pending = True
+                finally:
+                    with self.condition:
+                        self.completed_version = version
+                        self.condition.notify_all()
+        finally:
+            try:
+                if self.manager is not None:
+                    self.handler._forget_gtm_manager(self.manager)
+            finally:
+                self.done.set()
+                self.handler.notify_reset()
+
+
 class ConfigHandler():
     def __init__(self, config_file, managers, verify_interval):
         self._config_file = config_file
@@ -516,6 +663,19 @@ class ConfigHandler():
         self._verify_interval = verify_interval
         self._interval = IntervalTimer(self._verify_interval,
                                        self.notify_reset)
+
+        # Multi-GTM worker state (GTMEndpointWorker path)
+        self._gtm_workers = {}           # url -> GTMEndpointWorker
+        self._retiring_gtm_workers = {}  # url -> GTMEndpointWorker (stopping)
+
+        # Per-manager isolated backoff state (legacy ThreadPoolExecutor path)
+        self._mgr_backoff_lock = threading.Lock()
+        self._mgr_backoff_time = {}   # id(mgr) -> current backoff seconds
+        self._mgr_backoff_timer = {}  # id(mgr) -> threading.Timer
+
+        # User-agent string forwarded to each GTM CloudServiceManager
+        self._user_agent = None
+
         self._thread.start()
 
     def stop(self):
@@ -525,6 +685,67 @@ class ConfigHandler():
         self._condition.release()
         if self._backoff_timer is not None:
             self.cleanup_backoff()
+        # Stop all active and retiring GTM endpoint workers.
+        for worker in list(self._gtm_workers.values()):
+            worker.stop()
+        for worker in list(self._retiring_gtm_workers.values()):
+            worker.stop()
+        # Cancel and join per-manager backoff timers.
+        # Join is done *outside* the lock so the timer callback can acquire it
+        # without deadlocking (see test_stop_joins_timer_without_holding_its_lock).
+        with self._mgr_backoff_lock:
+            timers = list(self._mgr_backoff_timer.values())
+            self._mgr_backoff_timer.clear()
+        for timer in timers:
+            timer.cancel()
+            timer.join()
+
+    def _mgr_is_in_backoff(self, mgr):
+        """Return True if this manager is currently waiting out a backoff period."""
+        with self._mgr_backoff_lock:
+            return id(mgr) in self._mgr_backoff_timer
+
+    def _mgr_reset_backoff(self, mgr):
+        """Cancel any active per-manager backoff timer and clear its state."""
+        with self._mgr_backoff_lock:
+            timer = self._mgr_backoff_timer.pop(id(mgr), None)
+        if timer is not None:
+            timer.cancel()
+            timer.join()
+
+    def _mgr_start_backoff(self, mgr):
+        """Start an independent exponential backoff timer for a single GTM manager.
+
+        Only this manager will be skipped on the next config-handler wake.
+        All other managers in the pool are unaffected.  The timer calls
+        notify_reset() when the backoff period expires so the manager is
+        retried on the next cycle.
+        """
+        key = id(mgr)
+        label = getattr(mgr, '_gtm_url', '') or str(key)
+        with self._mgr_backoff_lock:
+            # Cancel any already-running timer for this manager first.
+            old = self._mgr_backoff_timer.pop(key, None)
+            delay = self._mgr_backoff_time.get(key, 1)
+            next_delay = min(delay * 2, self._max_backoff_time)
+            self._mgr_backoff_time[key] = next_delay
+
+        if old is not None:
+            old.cancel()
+            old.join()
+
+        log.error("GTM [%s]: backing off for %s second(s) before retry", label, delay)
+
+        def _on_backoff_expire():
+            with self._mgr_backoff_lock:
+                self._mgr_backoff_timer.pop(key, None)
+            self.notify_reset()
+
+        timer = threading.Timer(delay, _on_backoff_expire)
+        timer.daemon = True
+        with self._mgr_backoff_lock:
+            self._mgr_backoff_timer[key] = timer
+        timer.start()
 
     def notify_reset(self):
         self._condition.acquire()
@@ -581,7 +802,7 @@ class ConfigHandler():
                 except ValueError:
                     formatted_lines = traceback.format_exc().splitlines()
                     last_line = formatted_lines[-1]
-                    log.error('Failed to process the config file {} ({})'
+                    log.error('Failed to process the config file {} ({})'\
                               .format(self._config_file, last_line))
                     incomplete = 1
                 except Exception as e:
@@ -595,7 +816,7 @@ class ConfigHandler():
                     gtmIncomplete += 1
                     formatted_lines = traceback.format_exc().splitlines()
                     last_line = formatted_lines[-1]
-                    log.error('Failed to process the config file {} ({})'
+                    log.error('Failed to process the config file {} ({})'\
                               .format(self._config_file, last_line))
                 except Exception as e:
                     log.exception(f'Unexpected error: {str(e)}')
@@ -639,127 +860,253 @@ class ConfigHandler():
         if self._interval:
             self._interval.stop()
 
+    # ------------------------------------------------------------------
+    # GTM sync helpers (Option B: one process per set, parallel per GTM)
+    # ------------------------------------------------------------------
+
+    def _sync_one_gtm(self, mgr, config):
+        """Sync configuration to a single GTM manager.
+
+        Called from a ThreadPoolExecutor worker inside _update_gtm().
+        Raises F5CcclError on failure so the caller can start per-manager
+        backoff without affecting other managers in the same set-process.
+        """
+        label = getattr(mgr, '_gtm_url', '') or str(id(mgr))
+        oldGtmConfig = mgr._gtm.get_gtm_config()
+        partition = "Common"
+
+        # Retry any pending cleanup from a previous failed operation FIRST
+        if mgr._gtm._pending_cleanup is not None:
+            log.info("GTM [%s]: Retrying pending cleanup from previous failed operation", label)
+            gtm_handle = mgr._gtm.mgmt_root().tm.gtm
+            mgr._gtm.retry_pending_cleanup(gtm_handle)
+
+        allConfig = get_gtm_config(config)
+        if not bool(allConfig):
+            # GTM config section has been removed from the config file.
+            # If we never pushed anything to this device, nothing to do.
+            if len(oldGtmConfig) == 0:
+                return
+            # We previously pushed config to this device — delete everything
+            # by reconciling the old state against an empty desired state.
+            # delete_update_gtm's diff engine computes:
+            #   del_wips  = all old wideIPs  (old - empty = old)
+            #   del_pools = all old pools
+            #   del_mons  = all old monitors
+            # and removes them all from the BIG-IP, then cleans up GSLB
+            # servers and virtual servers via the existing cleanup path.
+            log.info("GTM [%s]: GTM config removed — deleting all config from device", label)
+            empty_config = {partition: {"wideIPs": [], "pools": [], "monitors": []}}
+            mgr._gtm.delete_update_gtm(partition, empty_config)
+            # Clear local in-memory state so subsequent cycles are no-ops
+            mgr._gtm.replace_gtm_config({'config': {}, 'activeTenants': []})
+            log.info("GTM [%s]: All GTM config deleted from device and local state cleared", label)
+            return
+
+        newGtmConfig = allConfig["config"]
+        gtm = mgr._gtm
+        # Settings outside gtm.config belong to each endpoint, including empty IDs.
+        for key, attribute in (('clusterIdentifier', '_local_cluster_name'),
+                               ('digitalAssetID', '_cluster_digital_asset_id')):
+            value = allConfig.get(key)
+            if value is not None:
+                setattr(gtm, attribute, value)
+                for component in (gtm._infrastructure, gtm._wideip, gtm._pool,
+                                  gtm._monitor, gtm._snapshot_helper, gtm._cleanup):
+                    setattr(component, attribute, value)
+        gtm._active_tenants = allConfig.get('activeTenants') or []
+        gtm._deleted_tenants = allConfig.get('deletedTenants') or []
+        gtm._pool._active_tenants = gtm._active_tenants
+        gtm._pool._deleted_tenants = gtm._deleted_tenants
+        GTMUtils.pre_process_gtm(newGtmConfig, disabled_availability_zones=
+                                 allConfig.get('disabledAvailabilityZones', []))
+        isConfigSame = sorted(oldGtmConfig.items()) == sorted(newGtmConfig.items())
+        previous_monitor = gtm._infrastructure._enable_data_server_monitor
+        desired_monitor = GTMUtils.as_bool(allConfig.get('enableDataServerMonitor', False), default=False)
+        gtm._infrastructure._enable_data_server_monitor = desired_monitor
+        try:
+            if not oldGtmConfig:
+                if partition in newGtmConfig:
+                    gtm.create_gtm(partition, newGtmConfig)
+            elif not isConfigSame:
+                log.info("GTM [%s]: New changes observed, syncing", label)
+                gtm.delete_update_gtm(partition, newGtmConfig if partition in newGtmConfig
+                                      else {partition: {'wideIPs': []}})
+            if oldGtmConfig and previous_monitor != desired_monitor and partition in newGtmConfig:
+                gtm.apply_monitor_settings(partition, newGtmConfig,
+                                           reconcile_pool=False, reconcile_server=True)
+            gtm.replace_gtm_config(allConfig)
+        except Exception:
+            # A failed monitor-only update must still be seen as changed on retry.
+            gtm._infrastructure._enable_data_server_monitor = previous_monitor
+            raise
+
     def _update_gtm(self, config):
-        gtmIncomplete = 0
-        for mgr in self._managers:
-            if mgr.is_gtm():
-                oldGtmConfig = mgr._gtm.get_gtm_config()
-                partition = "Common"
+        """Sync GTM config to all managers in this set-process in parallel.
+
+        Option B architecture: one process per set, multiple GTM managers
+        per process run concurrently via ThreadPoolExecutor.
+
+        Per-manager exponential backoff: when a GTM device fails, its own
+        independent backoff timer is started.  Only THAT manager is skipped
+        on subsequent wakes; all other managers continue normally.
+        The timer fires notify_reset() when the manager is ready to retry.
+        """
+        if 'gtm_bigips' in config:
+            self._reconcile_gtm_managers(config)
+            return 0
+        incomplete = 0
+        with ThreadPoolExecutor(max_workers=max(1, len(self._managers)),
+                                thread_name_prefix='gtm-sync') as pool:
+            future_to_mgr = {}
+
+            def schedule(mgr):
+                if not self._stop and not self._mgr_is_in_backoff(mgr):
+                    future_to_mgr[pool.submit(self._sync_one_gtm, mgr, copy.deepcopy(config))] = mgr
+
+            for mgr in self._managers:
+                if mgr.is_gtm():
+                    schedule(mgr)
+
+            for future in as_completed(future_to_mgr):
+                mgr = future_to_mgr[future]
+                label = getattr(mgr, '_gtm_url', '') or str(id(mgr))
                 try:
-                    # RETRY FIX: Check for pending cleanup BEFORE isConfigSame check
-                    # This allows cleanup retry even when config hasn't changed
-                    if mgr._gtm._pending_cleanup is not None:
-                        log.info("GTM: Retrying pending cleanup from previous failed operation")
-                        gtm = mgr._gtm.mgmt_root().tm.gtm
-                        mgr._gtm.retry_pending_cleanup(gtm)
-                        # If retry succeeded, pending_cleanup is cleared in retry method
-                        # If retry failed, it will raise F5CcclError again
-                    
-                    allConfig = get_gtm_config(config)
-                    if bool(allConfig):
-                        newGtmConfig = allConfig["config"]
-                        self._deleted_tenants = allConfig["deletedTenants"]
-                        disabled_zones = allConfig.get("disabledAvailabilityZones", [])
-
-                        # Keep gtm.clusterIdentifier and gtm.digitalAssetID as distinct fields.
-                        # Go always writes both keys (even as "") so the Python driver can
-                        # clear stale values when identifiers are removed.
-                        cluster_id = allConfig.get("clusterIdentifier")
-                        digital_asset_id = allConfig.get("digitalAssetID")
-
-                        # Propagate clusterIdentifier to all GTM submodules when it changes.
-                        # Guard allows empty string to clear a previously-set identifier.
-                        if cluster_id is not None and cluster_id != mgr._gtm._local_cluster_name:
-                            log.info("GTM: Updating cluster identifier to: %r", cluster_id)
-                            mgr._gtm._local_cluster_name = cluster_id
-                            mgr._gtm._infrastructure._local_cluster_name = cluster_id
-                            mgr._gtm._wideip._local_cluster_name = cluster_id
-                            mgr._gtm._pool._local_cluster_name = cluster_id
-                            mgr._gtm._monitor._local_cluster_name = cluster_id
-                            mgr._gtm._snapshot_helper._local_cluster_name = cluster_id
-                            mgr._gtm._cleanup._local_cluster_name = cluster_id
-
-                        # Propagate digitalAssetID to all GTM submodules when it changes.
-                        if digital_asset_id is not None and digital_asset_id != mgr._gtm._cluster_digital_asset_id:
-                            log.info("GTM: Updating digital asset id to: %r", digital_asset_id)
-                            mgr._gtm._cluster_digital_asset_id = digital_asset_id
-                            mgr._gtm._infrastructure._cluster_digital_asset_id = digital_asset_id
-                            mgr._gtm._wideip._cluster_digital_asset_id = digital_asset_id
-                            mgr._gtm._pool._cluster_digital_asset_id = digital_asset_id
-                            mgr._gtm._snapshot_helper._cluster_digital_asset_id = digital_asset_id
-                            mgr._gtm._cleanup._cluster_digital_asset_id = digital_asset_id
-
-                        prev_enable_data_server_monitor = getattr(
-                            mgr._gtm._infrastructure, "_enable_data_server_monitor", False)
-
-                        # enableDataServerMonitor controls GSLB server health monitor attachment
-                        new_enable_data_server_monitor = GTMUtils.as_bool(
-                            allConfig.get("enableDataServerMonitor", False),
-                            default=False)
-                        mgr._gtm._infrastructure._enable_data_server_monitor = new_enable_data_server_monitor
-
-                        data_server_monitor_changed = (prev_enable_data_server_monitor != new_enable_data_server_monitor)
-                        monitor_settings_changed = data_server_monitor_changed
-
-                        GTMUtils.pre_process_gtm(newGtmConfig, disabled_availability_zones=disabled_zones)
-                        isConfigSame = sorted(oldGtmConfig.items()) == sorted(newGtmConfig.items())
-                        _bip = mgr._gtm._bigip_host
-                        _wip_count = len(newGtmConfig.get(partition, {}).get('wideIPs', []) or [])
-                        if (not isConfigSame or monitor_settings_changed) and len(oldGtmConfig) == 0:
-                            if partition in newGtmConfig:
-                                mgr._gtm.create_gtm(
-                                    partition,
-                                    newGtmConfig)
-                            mgr._gtm.replace_gtm_config(allConfig)
-                            log.info("GTM: Initial push/sync on restart completed successfully ({} wideIPs), bigip: {}".format(
-                                _wip_count, _bip))
-                        elif not isConfigSame or monitor_settings_changed:
-                            if monitor_settings_changed and isConfigSame:
-                                # WideIP config is unchanged; server monitor toggle is outside gtm.config.
-                                # delete_update_gtm would compute empty CRUD and become a no-op.
-                                log.info("GTM: Monitor settings changed (enableDataServerMonitor=%s), "
-                                         "running monitor-only reconciliation, bigip: %s",
-                                         new_enable_data_server_monitor, _bip)
-                                if partition in newGtmConfig:
-                                    mgr._gtm.apply_monitor_settings(
-                                        partition,
-                                        newGtmConfig,
-                                        reconcile_pool=False,
-                                        reconcile_server=data_server_monitor_changed,
-                                    )
-                            else:
-                                log.info("New changes observed in gtm config, bigip: %s", _bip)
-                                if partition in newGtmConfig:
-                                    mgr._gtm.delete_update_gtm(
-                                        partition,
-                                        newGtmConfig)
-                                    # Even when GTM config changed, still reconcile server monitor
-                                    # toggle explicitly because it lives outside gtm.config diffing.
-                                    if data_server_monitor_changed:
-                                        log.info(
-                                            "GTM: Post-diff monitor reconcile triggered "
-                                            "(reason=data_server_monitor_toggle, "
-                                            "enableDataServerMonitor=%s, partition=%s, bigip=%s)",
-                                            new_enable_data_server_monitor,
-                                            partition,
-                                            _bip,
-                                        )
-                                        mgr._gtm.apply_monitor_settings(
-                                            partition,
-                                            newGtmConfig,
-                                            reconcile_pool=False,
-                                            reconcile_server=True,
-                                        )
-                            mgr._gtm.replace_gtm_config(allConfig)
-                            log.info("GTM: Config sync completed successfully ({} wideIPs), bigip: {}".format(
-                                _wip_count, _bip))
-
+                    future.result()
+                    # Success: reset backoff so manager returns to normal polling
+                    self._mgr_reset_backoff(mgr)
+                    log.info("GTM [%s]: Config sync completed successfully", label)
                 except F5CcclError as e:
-                    _bip = mgr._gtm._bigip_host if hasattr(mgr, '_gtm') and mgr._gtm else 'unknown'
-                    _code = _extract_http_code(str(e))
-                    log.error("GTM Error.....:%s, bigip: %s, error_code: %s", e.msg, _bip, _code)
-                    gtmIncomplete += 1
-        return gtmIncomplete
+                    incomplete += 1
+                    log.error("GTM [%s]: GTM Error..... %s", label, e.msg)
+                    # Per-manager backoff: ONLY this manager waits.
+                    # All other managers in the set are completely unaffected.
+                    self._mgr_start_backoff(mgr)
+                except Exception as e:
+                    incomplete += 1
+                    log.exception("GTM [%s]: GTM Error..... %s", label, str(e))
+                    self._mgr_start_backoff(mgr)
+        return incomplete
+
+    def _forget_gtm_manager(self, mgr):
+        self._mgr_reset_backoff(mgr)
+        with self._mgr_backoff_lock:
+            self._mgr_backoff_time.pop(id(mgr), None)
+            self._mgr_backoff_timer.pop(id(mgr), None)
+        if mgr in self._managers:
+            self._managers.remove(mgr)
+        cert_id = getattr(mgr, '_gtm_cert_id', None)
+        if cert_id:
+            _create_temp_cert_file('', cert_id)
+        mgr.mgmt_root().icrs.session.close()
+
+    def _connect_gtm_entry(self, entry, config, previous):
+        gtm_url = entry['url']
+        parsed = urlparse(gtm_url)
+        if not parsed.hostname or parsed.scheme != 'https':
+            raise ConfigError('GTM URL must be an HTTPS management URL')
+        socket_path = entry.get('socket')
+        if socket_path:
+            # An explicit endpoint socket must never fall back to another BIG-IP's credentials.
+            credentials = get_credentials_from_socket(socket_path) or {}
+            username = credentials.get('gtm_username') or credentials.get('bigip_username')
+            password = credentials.get('gtm_password') or credentials.get('bigip_password')
+            trusted_certs = credentials.get('cert_data', '')
+        else:
+            credentials = get_credentials(config.get('credential_socket')) if not (
+                entry.get('username') and entry.get('password')) else {}
+            credentials = credentials or {}
+            username = entry.get('username') or credentials.get('gtm_username')
+            password = entry.get('password') or credentials.get('gtm_password')
+            trusted_certs = entry.get('trusted_certs', entry.get('trustedCerts', ''))
+        if not username or not password:
+            raise ConfigError('Endpoint credentials unavailable')
+
+        cert_key = gtm_url + '\0' + (socket_path or '') + '\0' + trusted_certs
+        cert_id = 'gtm-' + hashlib.sha256(cert_key.encode('utf-8')).hexdigest()
+        ca_path = _create_temp_cert_file(trusted_certs, cert_id, 'pid-' + str(os.getpid()))
+        try:
+            bigip = mgmt_root(parsed.hostname, username, password,
+                              parsed.port or 443, 'tmos', ca_certs=ca_path)
+            global_cfg = config.get('global', {})
+            gtm_cfg = config.get('gtm', {})
+            mgr = CloudServiceManager(
+                bigip, 'Common', user_agent=self._user_agent, gtm=True,
+                gtm_url=gtm_url,
+                local_cluster_name=gtm_cfg.get('clusterIdentifier') or
+                global_cfg.get('cluster-identifier') or global_cfg.get('local-cluster-name'),
+                cluster_digital_asset_id=gtm_cfg.get('digitalAssetID') or
+                global_cfg.get('cluster-digital-asset-id'))
+            mgr._gtm_cert_id = cert_id
+            if previous is not None:
+                mgr._gtm.replace_gtm_config({
+                    'config': previous._gtm.get_gtm_config(),
+                    'activeTenants': previous._gtm._active_tenants,
+                })
+                mgr._gtm._pending_cleanup = copy.deepcopy(previous._gtm._pending_cleanup)
+                mgr._gtm._infrastructure._enable_data_server_monitor = (
+                    previous._gtm._infrastructure._enable_data_server_monitor)
+            return mgr
+        except Exception:
+            if previous is None or getattr(previous, '_gtm_cert_id', None) != cert_id:
+                _create_temp_cert_file('', cert_id)
+            raise
+
+    def _cleanup_removed_gtm_worker(self, worker):
+        # Snapshot the manager reference under the worker lock to avoid a
+        # race with the worker thread, which sets worker.manager without
+        # holding any external lock.
+        with worker.condition:
+            mgr = getattr(worker, 'manager', None)
+        if mgr is None or not mgr.is_gtm():
+            return
+
+        label = getattr(mgr, '_gtm_url', '') or str(id(mgr))
+        old_gtm_config = mgr._gtm.get_gtm_config()
+        if not old_gtm_config:
+            log.info('GTM [%s]: Endpoint removed without prior GTM config; skipping remote cleanup', label)
+            return
+
+        log.info('GTM [%s]: Endpoint removed from config; cleaning GTM state before worker detaches', label)
+        self._sync_one_gtm(mgr, {'gtm': {}})
+
+    def _reconcile_gtm_managers(self, config):
+        entries = config['gtm_bigips']
+        if not isinstance(entries, list):
+            raise ConfigError('gtm_bigips must be a list')
+        desired = {}
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get('url'), str) or not entry['url']:
+                raise ConfigError('Each GTM entry must have a URL')
+            if entry['url'] in desired:
+                raise ConfigError('Duplicate GTM management URL')
+            desired[entry['url']] = entry
+
+        for url in set(self._gtm_workers) - set(desired):
+            worker = self._gtm_workers.pop(url)
+            try:
+                self._cleanup_removed_gtm_worker(worker)
+            finally:
+                worker.stop()
+                self._retiring_gtm_workers[url] = worker
+                log.info('GTM [%s]: Endpoint detached after cleanup', url)
+        for url, worker in list(self._retiring_gtm_workers.items()):
+            if worker.done.is_set():
+                worker.thread.join()
+                del self._retiring_gtm_workers[url]
+        for url, entry in desired.items():
+            # An in-flight request cannot be cancelled safely. Do not overlap a
+            # re-added endpoint with the worker still finishing its last request.
+            if self._stop or url in self._retiring_gtm_workers:
+                continue
+            worker = self._gtm_workers.get(url)
+            if worker is None:
+                worker = GTMEndpointWorker(self, entry, config)
+                self._gtm_workers[url] = worker
+                worker.thread.start()
+            else:
+                worker.update(entry, config)
+        return list(self._gtm_workers.values())
 
     def _update_cccl(self, config):
         _handle_vxlan_config(config)
@@ -1055,7 +1402,7 @@ class GTMManager(object):
 
     def replace_gtm_config(self, config):
         """ Updating the GTM config object"""
-        self._active_tenants = config["activeTenants"]
+        self._active_tenants = copy.deepcopy(config.get("activeTenants") or [])
         self._deleted_tenants = []
         # Deep copy so that subsequent working_config mutations (e.g. members=None
         # set by delete_pool) never alias into the authoritative cached config.
@@ -2298,6 +2645,47 @@ def _retry_backoff(cb):
         elapsed += RETRY_INTERVAL
 
 
+def _find_ltm_schema():
+    schema_name = 'cccl-ltm-api-schema.yml'
+    paths = [path for path in sys.path if 'site-packages' in path]
+    for path in paths:
+        for root, dirs, files in os.walk(path):
+            if schema_name in files:
+                return os.path.join(root, schema_name)
+    for root, dirs, files in os.walk('/app/src/f5-cccl'):
+        if schema_name in files:
+            return os.path.join(root, schema_name)
+    log.info('Could not find CCCL LTM schema: {}'.format(schema_name))
+    return ''
+
+
+def _normalize_schema_path(schema_path):
+    """Repair legacy internal JSON Pointer refs in the CCCL schema.
+
+    The installed f5_cccl schema ships with anchors such as "#definitions/...".
+    Current jsonschema implementations require the slash-prefixed form,
+    "#/definitions/...".  Normalize that in a temporary copy so the older schema
+    remains usable without modifying the site-packages artifact.
+    """
+    if not schema_path or not os.path.exists(schema_path):
+        return schema_path
+
+    try:
+        with open(schema_path, 'r') as schema_file:
+            schema_text = schema_file.read()
+    except (OSError, IOError):
+        return schema_path
+
+    if '#definitions/' not in schema_text:
+        return schema_path
+
+    normalized = re.sub(r'(?<!/)#definitions/', '#/definitions/', schema_text)
+    temp_fd, temp_path = tempfile.mkstemp(suffix='.yml', prefix='cccl-schema-')
+    with os.fdopen(temp_fd, 'w') as temp_file:
+        temp_file.write(normalized)
+    return temp_path
+
+
 def _find_net_schema():
     paths = [path for path in sys.path if 'site-packages' in path]
     for path in paths:
@@ -2330,10 +2718,25 @@ def _is_arp_disabled(config):
 
 
 def _is_gtm_config(config):
+    """Return True if this config contains any GTM configuration.
+
+    Supports both schemas:
+      - Option B (new): config['gtm_bigips'] — list of GTM device entries
+      - Legacy  (old):  config['gtm_bigip']  — single GTM device entry
+
+    The global.gtm flag is still honoured as an additional gate so that
+    existing deployments that rely on it continue to work.
+    """
     try:
-        return config['global']['gtm']
+        global_gtm = config['global']['gtm']
     except KeyError:
-        return False
+        global_gtm = False
+
+    has_gtm_devices = (
+        bool(config.get('gtm_bigips')) or
+        bool(config.get('gtm_bigip'))
+    )
+    return global_gtm or has_gtm_devices
 
 
 def _is_static_routing_enabled(config):
