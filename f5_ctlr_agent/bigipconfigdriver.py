@@ -330,7 +330,8 @@ class CloudServiceManager():
                 partition,
                 user_agent=user_agent,
                 local_cluster_name=local_cluster_name,
-                cluster_digital_asset_id=cluster_digital_asset_id)
+                cluster_digital_asset_id=cluster_digital_asset_id,
+                gtm_url=gtm_url)
             self._cccl = None
         else:
             schema_path = schema_path or _find_ltm_schema()
@@ -576,10 +577,16 @@ class GTMEndpointWorker:
         self.thread = threading.Thread(target=self.run, name='gtm-' + entry['url'], daemon=True)
 
     def update(self, entry, config):
+        url = entry.get('url', self.entry.get('url', '?'))
         with self.condition:
-            if entry != self.entry:
+            entry_changed = entry != self.entry
+            if entry_changed:
                 self.retry_at = 0
                 self.backoff = 1
+                log.info('GTM [%s]: Endpoint config updated — reconnect will be triggered', url)
+            else:
+                log.debug('GTM [%s]: Config snapshot refreshed (endpoint unchanged, version %d -> %d)',
+                          url, self.version, self.version + 1)
             self.entry = copy.deepcopy(entry)
             self.config = copy.deepcopy(config)
             self.version += 1
@@ -587,11 +594,15 @@ class GTMEndpointWorker:
             self.condition.notify_all()
 
     def stop(self):
+        url = self.entry.get('url', '?')
+        log.info('GTM [%s]: Worker stop requested', url)
         with self.condition:
             self.stopped = True
             self.condition.notify_all()
 
     def run(self):
+        url = self.entry.get('url', '?')
+        log.info('GTM [%s]: Worker thread started', url)
         try:
             while True:
                 with self.condition:
@@ -599,46 +610,70 @@ class GTMEndpointWorker:
                         delay = self.retry_at - time.monotonic()
                         if self.pending and delay <= 0:
                             break
+                        if self.pending and delay > 0:
+                            log.debug('GTM [%s]: Backing off — retrying in %.1fs', url, delay)
                         self.condition.wait(delay if self.pending and delay > 0 else None)
                     if self.stopped:
+                        log.info('GTM [%s]: Worker thread exiting (stopped)', url)
                         return
                     entry = copy.deepcopy(self.entry)
                     config = copy.deepcopy(self.config)
                     version = self.version
+                    # Refresh URL from the latest entry snapshot in case it changed.
+                    url = entry.get('url', url)
                     self.pending = False
                 try:
-                    if self.manager is None or entry != self.connected_entry:
+                    if self.manager is None:
+                        log.info('GTM [%s]: Establishing initial connection (version=%d)',
+                                 url, version)
                         replacement = self.handler._connect_gtm_entry(entry, config, self.manager)
-                        if self.manager is not None:
-                            if getattr(self.manager, '_gtm_cert_id', None) == replacement._gtm_cert_id:
-                                self.manager._gtm_cert_id = None
-                            self.handler._forget_gtm_manager(self.manager)
                         self.manager = replacement
                         self.connected_entry = entry
+                        log.info('GTM [%s]: Connection established — starting first sync', url)
+                    elif entry != self.connected_entry:
+                        log.info('GTM [%s]: Endpoint entry changed — reconnecting (version=%d)',
+                                 url, version)
+                        replacement = self.handler._connect_gtm_entry(entry, config, self.manager)
+                        if getattr(self.manager, '_gtm_cert_id', None) == replacement._gtm_cert_id:
+                            self.manager._gtm_cert_id = None
+                        self.handler._forget_gtm_manager(self.manager)
+                        self.manager = replacement
+                        self.connected_entry = entry
+                        log.info('GTM [%s]: Reconnection successful — starting sync', url)
                     with self.condition:
                         # A removed endpoint or superseded connection must not start a sync.
                         if self.stopped:
+                            log.info('GTM [%s]: Worker stopped after connect, skipping sync', url)
                             return
                         if version != self.version:
+                            log.debug('GTM [%s]: Newer config available (version %d -> %d), '
+                                      'restarting cycle', url, version, self.version)
                             continue
+                    log.debug('GTM [%s]: Starting config sync (version=%d)', url, version)
                     self.handler._sync_one_gtm(self.manager, config)
                     with self.condition:
                         self.retry_at = 0
                         self.backoff = 1
                         if not self.stopped and version == self.version:
-                            log.info('GTM [%s]: Config sync completed successfully', entry['url'])
+                            log.info('GTM [%s]: Config sync completed successfully (version=%d)',
+                                     url, version)
                 except Exception as exc:
-                    log.error('GTM [%s]: GTM Error..... %s', entry['url'], exc)
+                    log.error('GTM [%s]: Sync error (version=%d, backoff=%.1fs): %s',
+                              url, version, self.backoff, exc)
                     with self.condition:
                         if entry == self.entry:
                             self.retry_at = time.monotonic() + self.backoff
-                            self.backoff = min(self.backoff * 2, self.handler._max_backoff_time)
+                            next_backoff = min(self.backoff * 2, self.handler._max_backoff_time)
+                            log.info('GTM [%s]: Will retry in %.1fs (next backoff %.1fs)',
+                                     url, self.backoff, next_backoff)
+                            self.backoff = next_backoff
                         self.pending = True
                 finally:
                     with self.condition:
                         self.completed_version = version
                         self.condition.notify_all()
         finally:
+            log.info('GTM [%s]: Worker thread cleaning up', url)
             try:
                 if self.manager is not None:
                     self.handler._forget_gtm_manager(self.manager)
@@ -648,7 +683,7 @@ class GTMEndpointWorker:
 
 
 class ConfigHandler():
-    def __init__(self, config_file, managers, verify_interval):
+    def __init__(self, config_file, managers, verify_interval, user_agent=None):
         self._config_file = config_file
         self._managers = managers
 
@@ -673,8 +708,10 @@ class ConfigHandler():
         self._mgr_backoff_time = {}   # id(mgr) -> current backoff seconds
         self._mgr_backoff_timer = {}  # id(mgr) -> threading.Timer
 
-        # User-agent string forwarded to each GTM CloudServiceManager
-        self._user_agent = None
+        # User-agent string forwarded to each GTM CloudServiceManager created
+        # by _connect_gtm_entry.  Accepted as a constructor parameter so tests
+        # and the multi-GTM startup path can supply it in one call.
+        self._user_agent = user_agent
 
         self._thread.start()
 
@@ -781,21 +818,26 @@ class ConfigHandler():
                     # PERF FIX #5: Parse config file ONCE instead of twice
                     config = _parse_config(self._config_file)
 
-                    if not _is_ltm_disabled(config) and 'resources' not in config:
-                        continue
+                    # Multi-GTM mode: these guards are LTM-oriented and must not
+                    # block GTM reconciliation when there is no LTM to manage.
+                    is_multi_gtm = bool(config.get('gtm_bigips'))
 
-                    if not _is_arp_disabled(config) and ('vxlan-arp' not in config or 'vxlan-fdb' not in config):
-                        continue
+                    if not is_multi_gtm:
+                        if not _is_ltm_disabled(config) and 'resources' not in config:
+                            continue
 
-                    if _is_static_routing_enabled(config) and 'static-routes' not in config:
-                        continue
+                        if not _is_arp_disabled(config) and ('vxlan-arp' not in config or 'vxlan-fdb' not in config):
+                            continue
 
-                    if _is_cis_secondary(config) and _is_primary_cluster_status_up(config):
-                        continue
+                        if _is_static_routing_enabled(config) and 'static-routes' not in config:
+                            continue
 
-                    if _is_cis_in_arbitrator_mode(config) and not _is_leader(config):
-                        log.debug("CIS in arbitrator mode and not the leader, skipping cccl config push")
-                        continue
+                        if _is_cis_secondary(config) and _is_primary_cluster_status_up(config):
+                            continue
+
+                        if _is_cis_in_arbitrator_mode(config) and not _is_leader(config):
+                            log.debug("CIS in arbitrator mode and not the leader, skipping cccl config push")
+                            continue
 
                     incomplete = self._update_cccl(config)
 
@@ -854,8 +896,17 @@ class ConfigHandler():
                     log.info('SCALE_PERF: Test data: %s',
                              json_data)
 
-                log.info('updating tasks finished, took %s seconds',
-                         time.time() - start_time)
+                gtm_worker_count = len(self._gtm_workers)
+                if gtm_worker_count:
+                    log.info('updating tasks finished in %.3fs — '
+                             'LTM incomplete=%d, GTM incomplete=%d, '
+                             'GTM endpoints active=%d',
+                             time.time() - start_time, incomplete,
+                             gtmIncomplete, gtm_worker_count)
+                else:
+                    log.info('updating tasks finished in %.3fs — '
+                             'LTM incomplete=%d, GTM incomplete=%d',
+                             time.time() - start_time, incomplete, gtmIncomplete)
 
         if self._interval:
             self._interval.stop()
@@ -924,15 +975,29 @@ class ConfigHandler():
         previous_monitor = gtm._infrastructure._enable_data_server_monitor
         desired_monitor = GTMUtils.as_bool(allConfig.get('enableDataServerMonitor', False), default=False)
         gtm._infrastructure._enable_data_server_monitor = desired_monitor
+        wideip_count = len((newGtmConfig.get(partition) or {}).get('wideIPs') or [])
         try:
             if not oldGtmConfig:
                 if partition in newGtmConfig:
+                    log.info("GTM [%s]: First sync — pushing initial config "
+                             "(%d wideIP(s), partition=%s)", label, wideip_count, partition)
                     gtm.create_gtm(partition, newGtmConfig)
+                    log.info("GTM [%s]: Initial config push complete", label)
+                else:
+                    log.info("GTM [%s]: First sync — no config present for partition=%s, "
+                             "nothing to push", label, partition)
             elif not isConfigSame:
-                log.info("GTM [%s]: New changes observed, syncing", label)
+                log.info("GTM [%s]: Config changed — syncing "
+                         "(%d wideIP(s), partition=%s)", label, wideip_count, partition)
                 gtm.delete_update_gtm(partition, newGtmConfig if partition in newGtmConfig
                                       else {partition: {'wideIPs': []}})
+                log.info("GTM [%s]: Incremental sync complete", label)
+            else:
+                log.debug("GTM [%s]: Config unchanged — no BIG-IP calls needed "
+                          "(%d wideIP(s), partition=%s)", label, wideip_count, partition)
             if oldGtmConfig and previous_monitor != desired_monitor and partition in newGtmConfig:
+                log.info("GTM [%s]: Monitor setting changed (%s -> %s) — "
+                         "applying to servers", label, previous_monitor, desired_monitor)
                 gtm.apply_monitor_settings(partition, newGtmConfig,
                                            reconcile_pool=False, reconcile_server=True)
             gtm.replace_gtm_config(allConfig)
@@ -978,13 +1043,13 @@ class ConfigHandler():
                     log.info("GTM [%s]: Config sync completed successfully", label)
                 except F5CcclError as e:
                     incomplete += 1
-                    log.error("GTM [%s]: GTM Error..... %s", label, e.msg)
+                    log.error("GTM [%s]: Sync failed (F5CcclError): %s", label, e.msg)
                     # Per-manager backoff: ONLY this manager waits.
                     # All other managers in the set are completely unaffected.
                     self._mgr_start_backoff(mgr)
                 except Exception as e:
                     incomplete += 1
-                    log.exception("GTM [%s]: GTM Error..... %s", label, str(e))
+                    log.exception("GTM [%s]: Sync failed (unexpected error): %s", label, str(e))
                     self._mgr_start_backoff(mgr)
         return incomplete
 
@@ -1006,6 +1071,8 @@ class ConfigHandler():
         if not parsed.hostname or parsed.scheme != 'https':
             raise ConfigError('GTM URL must be an HTTPS management URL')
         socket_path = entry.get('socket')
+        cred_source = 'socket={}'.format(socket_path) if socket_path else 'config/env'
+        log.debug('GTM [%s]: Resolving credentials (source: %s)', gtm_url, cred_source)
         if socket_path:
             # An explicit endpoint socket must never fall back to another BIG-IP's credentials.
             credentials = get_credentials_from_socket(socket_path) or {}
@@ -1020,25 +1087,36 @@ class ConfigHandler():
             password = entry.get('password') or credentials.get('gtm_password')
             trusted_certs = entry.get('trusted_certs', entry.get('trustedCerts', ''))
         if not username or not password:
-            raise ConfigError('Endpoint credentials unavailable')
+            raise ConfigError(
+                'GTM [{}]: Endpoint credentials unavailable (source: {})'.format(
+                    gtm_url, cred_source))
 
         cert_key = gtm_url + '\0' + (socket_path or '') + '\0' + trusted_certs
         cert_id = 'gtm-' + hashlib.sha256(cert_key.encode('utf-8')).hexdigest()
         ca_path = _create_temp_cert_file(trusted_certs, cert_id, 'pid-' + str(os.getpid()))
+        log.info('GTM [%s]: Connecting to %s:%s (user=%s, tls=%s)',
+                 gtm_url, parsed.hostname, parsed.port or 443,
+                 username, 'yes' if trusted_certs else 'no')
         try:
             bigip = mgmt_root(parsed.hostname, username, password,
                               parsed.port or 443, 'tmos', ca_certs=ca_path)
             global_cfg = config.get('global', {})
             gtm_cfg = config.get('gtm', {})
+            cluster_id = (gtm_cfg.get('clusterIdentifier') or
+                          global_cfg.get('cluster-identifier') or
+                          global_cfg.get('local-cluster-name'))
+            asset_id = (gtm_cfg.get('digitalAssetID') or
+                        global_cfg.get('cluster-digital-asset-id'))
             mgr = CloudServiceManager(
                 bigip, 'Common', user_agent=self._user_agent, gtm=True,
                 gtm_url=gtm_url,
-                local_cluster_name=gtm_cfg.get('clusterIdentifier') or
-                global_cfg.get('cluster-identifier') or global_cfg.get('local-cluster-name'),
-                cluster_digital_asset_id=gtm_cfg.get('digitalAssetID') or
-                global_cfg.get('cluster-digital-asset-id'))
+                local_cluster_name=cluster_id,
+                cluster_digital_asset_id=asset_id)
             mgr._gtm_cert_id = cert_id
             if previous is not None:
+                log.debug('GTM [%s]: Carrying forward state from previous manager '
+                          '(%d wideIP(s) in cache)', gtm_url,
+                          len(previous._gtm.get_gtm_config()))
                 mgr._gtm.replace_gtm_config({
                     'config': previous._gtm.get_gtm_config(),
                     'activeTenants': previous._gtm._active_tenants,
@@ -1046,8 +1124,12 @@ class ConfigHandler():
                 mgr._gtm._pending_cleanup = copy.deepcopy(previous._gtm._pending_cleanup)
                 mgr._gtm._infrastructure._enable_data_server_monitor = (
                     previous._gtm._infrastructure._enable_data_server_monitor)
+            log.info('GTM [%s]: Manager created (host=%s, cluster=%s, asset=%s)',
+                     gtm_url, parsed.hostname, cluster_id or 'unset', asset_id or 'unset')
             return mgr
-        except Exception:
+        except Exception as exc:
+            log.error('GTM [%s]: Connection failed (host=%s, user=%s, source=%s): %s',
+                      gtm_url, parsed.hostname, username, cred_source, exc)
             if previous is None or getattr(previous, '_gtm_cert_id', None) != cert_id:
                 _create_temp_cert_file('', cert_id)
             raise
@@ -1082,7 +1164,13 @@ class ConfigHandler():
                 raise ConfigError('Duplicate GTM management URL')
             desired[entry['url']] = entry
 
-        for url in set(self._gtm_workers) - set(desired):
+        log.info('GTM reconcile: desired=%d endpoint(s), active=%d, retiring=%d',
+                 len(desired), len(self._gtm_workers), len(self._retiring_gtm_workers))
+
+        # Remove workers for endpoints no longer in the desired set.
+        removed = set(self._gtm_workers) - set(desired)
+        for url in removed:
+            log.info('GTM [%s]: Endpoint removed from config — stopping worker', url)
             worker = self._gtm_workers.pop(url)
             try:
                 self._cleanup_removed_gtm_worker(worker)
@@ -1090,21 +1178,30 @@ class ConfigHandler():
                 worker.stop()
                 self._retiring_gtm_workers[url] = worker
                 log.info('GTM [%s]: Endpoint detached after cleanup', url)
+
+        # Collect completed retiring workers.
         for url, worker in list(self._retiring_gtm_workers.items()):
             if worker.done.is_set():
                 worker.thread.join()
                 del self._retiring_gtm_workers[url]
+                log.debug('GTM [%s]: Retired worker joined and released', url)
+
+        # Create new workers or push updated config to existing ones.
         for url, entry in desired.items():
             # An in-flight request cannot be cancelled safely. Do not overlap a
             # re-added endpoint with the worker still finishing its last request.
             if self._stop or url in self._retiring_gtm_workers:
+                log.debug('GTM [%s]: Skipping reconcile — worker retiring or handler stopped', url)
                 continue
             worker = self._gtm_workers.get(url)
             if worker is None:
+                log.info('GTM [%s]: Spawning new GTMEndpointWorker', url)
                 worker = GTMEndpointWorker(self, entry, config)
                 self._gtm_workers[url] = worker
                 worker.thread.start()
+                log.info('GTM [%s]: Worker thread started', url)
             else:
+                log.debug('GTM [%s]: Pushing config update to existing worker', url)
                 worker.update(entry, config)
         return list(self._gtm_workers.values())
 
@@ -1334,9 +1431,13 @@ class GTMManager(object):
     """
 
     def __init__(self, bigip, partition, user_agent=None, local_cluster_name=None,
-                 cluster_digital_asset_id=None):
+                 cluster_digital_asset_id=None, gtm_url=None):
         """Initialize an instance of the F5 CCCL service manager."""
-        log.debug("F5GTMManager initialize")
+        # _gtm_url is the management URL of this GTM device, used as a log label
+        # throughout all operations so every log line can be tied to a specific endpoint.
+        self._gtm_url = gtm_url or ''
+        label = self._gtm_url or 'legacy'
+        log.debug("GTM [%s]: GTMManager initializing", label)
 
         if user_agent is not None:
             bigip.icrs.append_user_agent(user_agent)
@@ -1354,8 +1455,9 @@ class GTMManager(object):
         except Exception:
             self._bigip_host = 'unknown'
         if not self._local_cluster_name and not self._cluster_digital_asset_id:
-            log.info("GTM: Running in legacy unscoped mode — all GTM objects will be "
-                     "treated as owned by this CIS instance as cluster identifier and digital asset ID are not set. ")
+            log.info("GTM [%s]: Running in legacy unscoped mode — all GTM objects will be "
+                     "treated as owned by this CIS instance (cluster identifier and "
+                     "digital asset ID are not set)", label)
         # PERF FIX #9: Cache BIG-IP version once
         self._bigip_version = None
         # RETRY FIX: Track pending cleanup state for isConfigSame retry scenario
@@ -2784,108 +2886,118 @@ def main():
         local_cluster_name = config.get('gtm', {}).get('clusterIdentifier') or local_cluster_name
         cluster_digital_asset_id = config.get('gtm', {}).get('digitalAssetID') or cluster_digital_asset_id
         namespace = config.get('gtm', {}).get('namespace') or namespace
-        config = _handle_credentials(config)
-        host, port = _handle_bigip_config(config)
-
-        # E7: Prepare temporary cert file(s) for TLS verification.
-        # In GTM-only mode the BIG-IP and GTM endpoints resolve to the same
-        # GTM VE and use the same CA cert from certSecret.  Share one temp
-        # file between the two ManagementRoot sessions so only one PEM is
-        # created per GTM endpoint.
-        worker_id = config.get('worker_id', '')
-        bigip_trusted_certs = config['bigip'].get('trusted_certs', '')
-        gtm_trusted_certs = config['gtm_bigip'].get('trusted_certs', '') \
-            if 'gtm_bigip' in config else ''
-        if bigip_trusted_certs and bigip_trusted_certs == gtm_trusted_certs:
-            shared_ca_certs_path = _create_temp_cert_file(
-                bigip_trusted_certs, 'bigip', worker_id)
-            bigip_ca_certs_path = shared_ca_certs_path
-            gtm_ca_certs_path = shared_ca_certs_path
-            log.debug('Using shared temporary certificate file for bigip and gtm_bigip')
-        else:
-            bigip_ca_certs_path = _create_temp_cert_file(
-                bigip_trusted_certs, 'bigip', worker_id) if bigip_trusted_certs else None
-            gtm_ca_certs_path = _create_temp_cert_file(
-                gtm_trusted_certs, 'gtmbigip', worker_id) if gtm_trusted_certs else None
-
-        # BIG-IP to manage
-        def _bigip_connect_cb(log_success):
-            try:
-                bigip = mgmt_root(
-                    host,
-                    config['bigip']['username'],
-                    config['bigip']['password'],
-                    port,
-                    "tmos",
-                    ca_certs=bigip_ca_certs_path)
-                if log_success:
-                    log.info('BIG-IP connection established.')
-                return (True, bigip)
-            except Exception as e:
-                error = 'BIG-IP connection error: {}'.format(e)
-                return (False, error, _is_non_retryable_error(error))
-        bigip = _retry_backoff(_bigip_connect_cb)
-
         user_agent = _set_user_agent(args.ctlr_prefix)
-
-        # GTM BIG-IP to manage
-        def _gtmbigip_connect_cb(log_success):
-            url = urlparse(config['gtm_bigip']['url'])
-            host = url.hostname
-            port = url.port
-            if not port:
-                port = 443
-            try:
-                bigip = mgmt_root(
-                    host,
-                    config['gtm_bigip']['username'],
-                    config['gtm_bigip']['password'],
-                    port,
-                    "tmos",
-                    ca_certs=gtm_ca_certs_path)
-                if log_success:
-                    log.info('GTM BIG-IP connection established, bigip: %s', host)
-                return (True, bigip)
-            except Exception as e:
-                code = _extract_http_code(str(e))
-                error = 'GTM BIG-IP connection error: {}, bigip: {}, error_code: {}'.format(e, host, code)
-                return (False, error, _is_non_retryable_error(error))
-
         managers = []
-        if not _is_ltm_disabled(config):
-            for partition in config['bigip']['partitions']:
+
+        # Multi-GTM path (gtm_bigips list): credentials and connections are
+        # resolved per-endpoint inside _connect_gtm_entry / GTMEndpointWorker.
+        # Skip the shared credential socket, BIG-IP connect, and legacy GTM
+        # connect blocks entirely — they all assume a single shared socket that
+        # does not exist in the multi-endpoint deployment model.
+        if config.get('gtm_bigips'):
+            log.info('Multi-GTM mode: %d endpoint(s) will be managed by GTMEndpointWorker',
+                     len(config['gtm_bigips']))
+            handler = ConfigHandler(args.config_file, managers, verify_interval,
+                                    user_agent=user_agent)
+        else:
+            config = _handle_credentials(config)
+            host, port = _handle_bigip_config(config)
+
+            # E7: Prepare temporary cert file(s) for TLS verification.
+            # In GTM-only mode the BIG-IP and GTM endpoints resolve to the same
+            # GTM VE and use the same CA cert from certSecret.  Share one temp
+            # file between the two ManagementRoot sessions so only one PEM is
+            # created per GTM endpoint.
+            worker_id = config.get('worker_id', '')
+            bigip_trusted_certs = config['bigip'].get('trusted_certs', '')
+            gtm_trusted_certs = config['gtm_bigip'].get('trusted_certs', '') \
+                if 'gtm_bigip' in config else ''
+            if bigip_trusted_certs and bigip_trusted_certs == gtm_trusted_certs:
+                shared_ca_certs_path = _create_temp_cert_file(
+                    bigip_trusted_certs, 'bigip', worker_id)
+                bigip_ca_certs_path = shared_ca_certs_path
+                gtm_ca_certs_path = shared_ca_certs_path
+                log.debug('Using shared temporary certificate file for bigip and gtm_bigip')
+            else:
+                bigip_ca_certs_path = _create_temp_cert_file(
+                    bigip_trusted_certs, 'bigip', worker_id) if bigip_trusted_certs else None
+                gtm_ca_certs_path = _create_temp_cert_file(
+                    gtm_trusted_certs, 'gtmbigip', worker_id) if gtm_trusted_certs else None
+
+            # BIG-IP to manage
+            def _bigip_connect_cb(log_success):
+                try:
+                    bigip = mgmt_root(
+                        host,
+                        config['bigip']['username'],
+                        config['bigip']['password'],
+                        port,
+                        "tmos",
+                        ca_certs=bigip_ca_certs_path)
+                    if log_success:
+                        log.info('BIG-IP connection established.')
+                    return (True, bigip)
+                except Exception as e:
+                    error = 'BIG-IP connection error: {}'.format(e)
+                    return (False, error, _is_non_retryable_error(error))
+            bigip = _retry_backoff(_bigip_connect_cb)
+
+            # GTM BIG-IP to manage
+            def _gtmbigip_connect_cb(log_success):
+                url = urlparse(config['gtm_bigip']['url'])
+                host = url.hostname
+                port = url.port
+                if not port:
+                    port = 443
+                try:
+                    bigip = mgmt_root(
+                        host,
+                        config['gtm_bigip']['username'],
+                        config['gtm_bigip']['password'],
+                        port,
+                        "tmos",
+                        ca_certs=gtm_ca_certs_path)
+                    if log_success:
+                        log.info('GTM BIG-IP connection established, bigip: %s', host)
+                    return (True, bigip)
+                except Exception as e:
+                    code = _extract_http_code(str(e))
+                    error = 'GTM BIG-IP connection error: {}, bigip: {}, error_code: {}'.format(e, host, code)
+                    return (False, error, _is_non_retryable_error(error))
+
+            if not _is_ltm_disabled(config):
+                for partition in config['bigip']['partitions']:
+                    manager = CloudServiceManager(
+                        bigip,
+                        partition,
+                        user_agent=user_agent)
+                    managers.append(manager)
+            if vxlan_partition:
                 manager = CloudServiceManager(
                     bigip,
-                    partition,
-                    user_agent=user_agent)
-                managers.append(manager)
-        if vxlan_partition:
-            manager = CloudServiceManager(
-                bigip,
-                vxlan_partition,
-                user_agent=user_agent,
-                prefix=args.ctlr_prefix,
-                schema_path=_find_net_schema())
-            managers.append(manager)
-        if _is_gtm_config(config):
-            if "gtm_bigip" in config:
-                gtmbigip = _retry_backoff(_gtmbigip_connect_cb)
-            else:
-                gtmbigip = _retry_backoff(_bigip_connect_cb)
-                log.info("GTM: Missing gtm_bigip section on config.")
-            for partition in config['bigip']['partitions']:
-                manager = CloudServiceManager(
-                    gtmbigip,
-                    partition,
+                    vxlan_partition,
                     user_agent=user_agent,
-                    gtm=True,
-                    local_cluster_name=local_cluster_name,
-                    cluster_digital_asset_id=cluster_digital_asset_id)
+                    prefix=args.ctlr_prefix,
+                    schema_path=_find_net_schema())
                 managers.append(manager)
+            if _is_gtm_config(config):
+                if "gtm_bigip" in config:
+                    gtmbigip = _retry_backoff(_gtmbigip_connect_cb)
+                else:
+                    gtmbigip = _retry_backoff(_bigip_connect_cb)
+                    log.info("GTM: Missing gtm_bigip section on config.")
+                for partition in config['bigip']['partitions']:
+                    manager = CloudServiceManager(
+                        gtmbigip,
+                        partition,
+                        user_agent=user_agent,
+                        gtm=True,
+                        local_cluster_name=local_cluster_name,
+                        cluster_digital_asset_id=cluster_digital_asset_id)
+                    managers.append(manager)
 
-        handler = ConfigHandler(args.config_file,
-                                managers,
-                                verify_interval)
+            handler = ConfigHandler(args.config_file, managers, verify_interval,
+                                    user_agent=user_agent)
 
         if os.path.exists(args.config_file):
             handler.notify_reset()
